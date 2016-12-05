@@ -57,6 +57,17 @@ void KalmanFilter::update(const Eigen::VectorXd& y) {
   t += dt;
 }
 
+void KalmanFilter::predict() {
+
+  if(!initialized)
+    throw std::runtime_error("Filter is not initialized!");
+
+  x_hat_new = A * x_hat;
+  P = A*P*A.transpose() + Q;
+  x_hat = x_hat_new;
+  t += dt;
+}
+
 void KalmanFilter::update(const Eigen::VectorXd& y, double dt, const Eigen::MatrixXd A) {
 
   this->A = A;

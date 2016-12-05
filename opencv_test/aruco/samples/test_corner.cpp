@@ -1,0 +1,411 @@
+/*
+By downloading, copying, installing or using the software you agree to this
+license. If you do not agree to this license, do not download, install,
+copy or use the software.
+
+                          License Agreement
+               For Open Source Computer Vision Library
+                       (3-clause BSD License)
+
+Copyright (C) 2013, OpenCV Foundation, all rights reserved.
+Third party copyrights are property of their respective owners.
+
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
+
+  * Redistributions of source code must retain the above copyright notice,
+    this list of conditions and the following disclaimer.
+
+  * Redistributions in binary form must reproduce the above copyright notice,
+    this list of conditions and the following disclaimer in the documentation
+    and/or other materials provided with the distribution.
+
+  * Neither the names of the copyright holders nor the names of the contributors
+    may be used to endorse or promote products derived from this software
+    without specific prior written permission.
+
+This software is provided by the copyright holders and contributors "as is" and
+any express or implied warranties, including, but not limited to, the implied
+warranties of merchantability and fitness for a particular purpose are
+disclaimed. In no event shall copyright holders or contributors be liable for
+any direct, indirect, incidental, special, exemplary, or consequential damages
+(including, but not limited to, procurement of substitute goods or services;
+loss of use, data, or profits; or business interruption) however caused
+and on any theory of liability, whether in contract, strict liability,
+or tort (including negligence or otherwise) arising in any way out of
+the use of this software, even if advised of the possibility of such damage.
+*/
+
+
+#include <opencv2/highgui.hpp>
+#include <opencv2/aruco.hpp>
+#include <iostream>
+
+#include <vector>
+#include <Eigen/Dense>
+
+#include "kalman.hpp"
+#include <time.h>
+
+using namespace std;
+using namespace cv;
+
+//#define dt 0.3//seconds
+float clocks_per_sec = CLOCKS_PER_SEC / 300;
+namespace {
+const char* about = "Basic marker detection";
+const char* keys  =
+        "{d        |       | dictionary: DICT_4X4_50=0, DICT_4X4_100=1, DICT_4X4_250=2,"
+        "DICT_4X4_1000=3, DICT_5X5_50=4, DICT_5X5_100=5, DICT_5X5_250=6, DICT_5X5_1000=7, "
+        "DICT_6X6_50=8, DICT_6X6_100=9, DICT_6X6_250=10, DICT_6X6_1000=11, DICT_7X7_50=12,"
+        "DICT_7X7_100=13, DICT_7X7_250=14, DICT_7X7_1000=15, DICT_ARUCO_ORIGINAL = 16}"
+        "{v        |       | Input from video file, if ommited, input comes from camera }"
+        "{ci       | 0     | Camera id if input doesnt come from video (-v) }"
+        "{c        |       | Camera intrinsic parameters. Needed for camera pose }"
+        "{l        | 0.1   | Marker side lenght (in meters). Needed for correct scale in camera pose }"
+        "{dp       |       | File of marker detector parameters }"
+        "{r        |       | show rejected candidates too }";
+}
+
+/**
+ */
+static bool readCameraParameters(string filename, Mat &camMatrix, Mat &distCoeffs) {
+    FileStorage fs(filename, FileStorage::READ);
+    if(!fs.isOpened())
+        return false;
+    fs["camera_matrix"] >> camMatrix;
+    fs["distortion_coefficients"] >> distCoeffs;
+    return true;
+}
+
+
+
+/**
+ */
+static bool readDetectorParameters(string filename, aruco::DetectorParameters &params) {
+    FileStorage fs(filename, FileStorage::READ);
+    if(!fs.isOpened())
+        return false;
+    fs["adaptiveThreshWinSizeMin"] >> params.adaptiveThreshWinSizeMin;
+    fs["adaptiveThreshWinSizeMax"] >> params.adaptiveThreshWinSizeMax;
+    fs["adaptiveThreshWinSizeStep"] >> params.adaptiveThreshWinSizeStep;
+    fs["adaptiveThreshConstant"] >> params.adaptiveThreshConstant;
+    fs["minMarkerPerimeterRate"] >> params.minMarkerPerimeterRate;
+    fs["maxMarkerPerimeterRate"] >> params.maxMarkerPerimeterRate;
+    fs["polygonalApproxAccuracyRate"] >> params.polygonalApproxAccuracyRate;
+    fs["minCornerDistanceRate"] >> params.minCornerDistanceRate;
+    fs["minDistanceToBorder"] >> params.minDistanceToBorder;
+    fs["minMarkerDistanceRate"] >> params.minMarkerDistanceRate;
+    fs["doCornerRefinement"] >> params.doCornerRefinement;
+    fs["cornerRefinementWinSize"] >> params.cornerRefinementWinSize;
+    fs["cornerRefinementMaxIterations"] >> params.cornerRefinementMaxIterations;
+    fs["cornerRefinementMinAccuracy"] >> params.cornerRefinementMinAccuracy;
+    fs["markerBorderBits"] >> params.markerBorderBits;
+    fs["perspectiveRemovePixelPerCell"] >> params.perspectiveRemovePixelPerCell;
+    fs["perspectiveRemoveIgnoredMarginPerCell"] >> params.perspectiveRemoveIgnoredMarginPerCell;
+    fs["maxErroneousBitsInBorderRate"] >> params.maxErroneousBitsInBorderRate;
+    fs["minOtsuStdDev"] >> params.minOtsuStdDev;
+    fs["errorCorrectionRate"] >> params.errorCorrectionRate;
+    return true;
+}
+
+
+
+/**
+ */
+int main(int argc, char *argv[]) {
+    CommandLineParser parser(argc, argv, keys);
+    parser.about(about);
+
+    if(argc < 2) {
+        parser.printMessage();
+        return 0;
+    }
+
+    int dictionaryId = parser.get<int>("d");
+    bool showRejected = parser.has("r");
+    bool estimatePose = parser.has("c");
+    float markerLength = parser.get<float>("l");
+
+    aruco::DetectorParameters detectorParams;
+    if(parser.has("dp")) {
+        bool readOk = readDetectorParameters(parser.get<string>("dp"), detectorParams);
+        if(!readOk) {
+            std::cerr << "Invalid detector parameters file" << std::endl;
+            return 0;
+        }
+    }
+    detectorParams.doCornerRefinement = true; // do corner refinement in markers
+
+    int camId = parser.get<int>("ci");
+
+    String video;
+    if(parser.has("v")) {
+        video = parser.get<String>("v");
+    }
+
+    if(!parser.check()) {
+        parser.printErrors();
+        return 0;
+    }
+
+    aruco::Dictionary dictionary =
+        aruco::getPredefinedDictionary(aruco::PREDEFINED_DICTIONARY_NAME(dictionaryId));
+
+    Mat camMatrix, distCoeffs;
+    if(estimatePose) {
+        bool readOk = readCameraParameters(parser.get<string>("c"), camMatrix, distCoeffs);
+        if(!readOk) {
+            std::cerr << "Invalid camera file" << std::endl;
+            return 0;
+        }
+    }
+
+    VideoCapture inputVideo;
+    int waitTime;
+    if(!video.empty()) {
+        inputVideo.open(video);
+        waitTime = 0;
+    } else {
+        inputVideo.open(camId);
+        waitTime = 10;
+    }
+
+    vector< vector< Point2f > > tempCorners;
+    vector< int > tempids;
+    double totalTime = 0;
+    int totalIterations = 0;
+    float prev_x = 0;
+    float prev_y = 0;
+
+    /* Kalman Filter */
+    int n = 4; // Number of states
+    int m = 2; // Number of measurements
+
+    double dt = 1.0/10; // Time step
+
+    Eigen::MatrixXd A(n, n); // System dynamics matrix
+    Eigen::MatrixXd C(m, n); // Output matrix
+    Eigen::MatrixXd Q(n, n); // Process noise covariance
+    Eigen::MatrixXd R(m, m); // Measurement noise covariance
+    Eigen::MatrixXd P(n, n); // Estimate error covariance
+
+    // Discrete LTI projectile motion, measuring position only
+    A << 1, 0, 0, 0, 
+         0, 1, 0, 0, 
+         0, 0, 1, 0,
+         0, 0, 0, 1;
+    C << 1, 0, 0, 0,
+         0, 1, 0, 0;
+
+      // Reasonable covariance matrices
+      double stdvq=0.1;
+      Q << stdvq*pow(dt,4)/4, 0, stdvq*pow(dt,3)/2, 0,
+           0, stdvq*pow(dt,4)/4, 0, stdvq*pow(dt,3)/2,
+           stdvq*pow(dt,3)/2, 0, stdvq*pow(dt,2),0,
+           0,stdvq*pow(dt,3)/2, 0, stdvq*pow(dt,2);
+      double stdvr=0.1;
+      R << stdvr,0,0,stdvr;
+      double stdvp=1;
+      P << stdvp, 0, 0, 0,
+           0, stdvp, 0, 0,
+           0, 0, stdvp, 0,
+           0, 0, 0, stdvp;
+
+      std::cout << "A: \n" << A << std::endl;
+      std::cout << "C: \n" << C << std::endl;
+      std::cout << "Q: \n" << Q << std::endl;
+      std::cout << "R: \n" << R << std::endl;
+      std::cout << "P: \n" << P << std::endl;
+
+      // Construct the filter
+    KalmanFilter kf0(dt, A, C, Q, R, P);
+    KalmanFilter kf1(dt, A, C, Q, R, P);
+    KalmanFilter kf2(dt, A, C, Q, R, P);
+    KalmanFilter kf3(dt, A, C, Q, R, P);
+
+    // Best guess of initial states
+    Eigen::VectorXd x0(n);
+    Eigen::VectorXd x1(n);
+    Eigen::VectorXd x2(n);
+    Eigen::VectorXd x3(n);
+
+    // Feed measurements into filter, output estimated states
+    double t = 0;
+    Eigen::VectorXd y0(m);
+    Eigen::VectorXd y1(m);
+    Eigen::VectorXd y2(m);
+    Eigen::VectorXd y3(m);
+
+    /* Kalman Filter ends */
+
+    bool first =true;
+    float start_time, current_time, current_time_BEFORE, delta_time;
+    start_time = (float)clock();
+ 
+    while(inputVideo.grab()) {
+
+        current_time = (float)clock()-start_time+delta_time;
+	cout<<"Current time"<< current_time << endl;
+	cout<<"Clocks per second"<< clocks_per_sec << endl;
+	cout<<"Current time / Clocks_per_sec"<< current_time/clocks_per_sec << endl;
+	cout<< "Delta T" << endl;
+
+        if((current_time/clocks_per_sec) >= dt)
+        {   
+            cout << "3" << endl;
+            current_time_BEFORE = (float)clock();
+            Mat image, imageCopy;
+            inputVideo.retrieve(image);
+
+            double tick = (double)getTickCount();
+
+            vector< int > ids;
+            vector< vector< Point2f > > corners, rejected;
+            //vector< vector< Point2f > > rejected;
+            vector< Vec3d > rvecs, tvecs;
+
+            // detect markers and estimate pose
+            aruco::detectMarkers(image, dictionary, corners, ids, detectorParams, rejected);
+
+            //tempCorners = corners;
+            if(corners.size() != 0 && first == true){
+                tempCorners = corners;
+                tempids = ids;
+                 first = false;
+                 x0 << float(corners[0][0].x), float(corners[0][0].y), 0.0, 0.0;
+                 x1 << corners[0][1].x, corners[0][1].y, 0, 0;
+                 x2 << corners[0][2].x, corners[0][2].y, 0, 0;
+                 x3 << corners[0][3].x, corners[0][3].y, 0, 0;
+                 kf0.init(0, x0);
+                 kf1.init(0, x1);
+                 kf2.init(0, x2);
+                 kf3.init(0, x3);
+                 continue;
+            }
+
+            if (!first){
+            if(corners.size() != 0) {
+                tempCorners = corners;
+                tempids = ids;
+                //cout << corners.size() << endl;
+                float current_x_0 = corners[0][0].x;
+                float current_y_0 = corners[0][0].y;
+                y0 << current_x_0, current_y_0;
+                kf0.update(y0);
+                std::cout << y0.transpose()
+                << ", x_hat0 = " << kf0.state().transpose()[0] << kf0.state().transpose()[1] << std::endl;
+                corners[0][0].x=kf0.state().transpose()[0];
+                corners[0][0].y=kf0.state().transpose()[1];
+
+
+                float current_x_1 = corners[0][1].x;
+                float current_y_1 = corners[0][1].y;
+                y1 << current_x_1, current_y_1;
+                kf1.update(y1);
+                std::cout << y1.transpose()
+                << ", x_hat1 = " << kf1.state().transpose()[0] << kf1.state().transpose()[1] << std::endl;
+                corners[0][1].x=kf1.state().transpose()[0];
+                corners[0][1].y=kf1.state().transpose()[1];
+
+                float current_x_2 = corners[0][2].x;
+                float current_y_2 = corners[0][2].y;
+                y2 << current_x_2, current_y_2;
+                kf2.update(y2);
+                std::cout << y2.transpose()
+                << ", x_hat2 = " << kf2.state().transpose()[0] << kf2.state().transpose()[1] << std::endl;
+                corners[0][2].x=kf2.state().transpose()[0];
+                corners[0][2].y=kf2.state().transpose()[1];
+
+                float current_x_3 = corners[0][3].x;
+                float current_y_3 = corners[0][3].y;
+                y3<< current_x_3, current_y_3;
+                kf3.update(y3);
+                std::cout << y3.transpose()
+                << ", x_hat3 = " << kf3.state().transpose()[0] << kf3.state().transpose()[1] << std::endl; 
+                corners[0][3].x=kf3.state().transpose()[0];
+                corners[0][3].y=kf3.state().transpose()[1];  
+                cout<<"measure"<<endl;                   
+            }
+            else {
+                 cout<<"predict"<<endl;
+               
+                 kf0.predict();
+                 kf1.predict();
+                 kf2.predict();
+                 kf3.predict();
+                 corners = tempCorners;
+                 ids = tempids;
+                 std::cout << ", x_hat = " << kf0.state().transpose() << std::endl;
+                 corners[0][0].x = kf0.state().transpose()[0];
+                 corners[0][0].y = kf0.state().transpose()[1];
+                 corners[0][1].x = kf1.state().transpose()[0];
+                 corners[0][1].y = kf1.state().transpose()[1];
+                 corners[0][2].x = kf2.state().transpose()[0];
+                 corners[0][2].y = kf2.state().transpose()[1];
+                 corners[0][3].x = kf3.state().transpose()[0];
+                 corners[0][3].y = kf3.state().transpose()[1]; 
+     
+                 image.copyTo(imageCopy);
+                 aruco::drawDetectedMarkers(imageCopy, corners, ids);
+                 aruco::estimatePoseSingleMarkers(corners, markerLength, camMatrix, distCoeffs, rvecs, tvecs);
+                 aruco::drawAxis(imageCopy, camMatrix, distCoeffs, rvecs[0], tvecs[0],
+                                           markerLength * 0.5f);                
+    
+     
+
+            }
+          }
+          
+            if(estimatePose && ids.size() > 0) {
+
+                aruco::estimatePoseSingleMarkers(corners, markerLength, camMatrix, distCoeffs, rvecs, tvecs);
+              }
+    
+
+            //aruco::estimatePoseSingleMarkers(corners, markerLength, camMatrix, distCoeffs, rvecs, tvecs);
+
+            double currentTime = ((double)getTickCount() - tick) / getTickFrequency();
+            totalTime += currentTime;
+            totalIterations++;
+            if(totalIterations % 30 == 0) {
+                //std::cout << "Detection Time = " << currentTime * 1000 << " ms "
+                //     << "(Mean = " << 1000 * totalTime / double(totalIterations) << " ms)" << std::endl;
+            }
+
+            t += dt;
+
+
+            
+
+            // draw results
+            image.copyTo(imageCopy);
+
+            if(ids.size() > 0) {
+                aruco::drawDetectedMarkers(imageCopy, corners, ids);
+
+                if(estimatePose) {
+                    for(unsigned int i = 0; i < ids.size(); i++)
+                        aruco::drawAxis(imageCopy, camMatrix, distCoeffs, rvecs[i], tvecs[i],
+                                        markerLength * 0.5f);
+                }
+            }
+            /*aruco::drawDetectedMarkers(imageCopy, corners, ids);
+            aruco::drawAxis(imageCopy, camMatrix, distCoeffs, rvecs[0], tvecs[0],
+                                        markerLength * 0.5f);
+            */
+            if(showRejected && rejected.size() > 0)
+                aruco::drawDetectedMarkers(imageCopy, rejected, noArray(), Scalar(100, 0, 255));
+            cout << "imshow" << endl;
+            imshow("out", imageCopy);
+            char key = (char)waitKey(waitTime);
+            if(key == 27) break;
+            
+            start_time = (float)clock();
+            delta_time = start_time-current_time_BEFORE;
+        
+      }
+    }
+
+    return 0;
+}

@@ -59,6 +59,12 @@ public:
   * using the given time step and dynamics matrix.
   */
   void update(const Eigen::VectorXd& y, double dt, const Eigen::MatrixXd A);
+  
+
+  /*
+   predict the state of the kalman filter while 
+   no measurement been given*/
+  void predict();
 
   /**
   * Return the current state and time.
